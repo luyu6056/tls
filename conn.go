@@ -57,6 +57,11 @@ type Conn struct {
 	// NewSessionTicket messages. nil if config.SessionTicketsDisabled.
 	resumptionSecret []byte
 
+	// ticketKeys is the set of active session ticket keys for this
+	// connection. The first one is used to encrypt new tickets and
+	// all are tried to decrypt tickets.
+	ticketKeys []ticketKey
+
 	// clientFinishedIsFirst is true if the client sent the first Finished
 	// message during the most recent handshake. This is recorded because
 	// the first transmitted Finished message is the tls-unique
@@ -122,9 +127,22 @@ type halfConn struct {
 	trafficSecret []byte // current TLS 1.3 traffic secret
 }
 
+type permamentError struct {
+	err net.Error
+}
+
+func (e *permamentError) Error() string   { return e.err.Error() }
+func (e *permamentError) Unwrap() error   { return e.err }
+func (e *permamentError) Timeout() bool   { return e.err.Timeout() }
+func (e *permamentError) Temporary() bool { return false }
+
 func (hc *halfConn) setErrorLocked(err error) error {
-	hc.err = err
-	return err
+	if e, ok := err.(net.Error); ok {
+		hc.err = &permamentError{err: e}
+	} else {
+		hc.err = err
+	}
+	return hc.err
 }
 
 // prepareCipherSpec sets the encryption and MAC states
@@ -1206,6 +1224,33 @@ func (c *Conn) handleKeyUpdate(keyUpdate *keyUpdateMsg) error {
 	}
 
 	return nil
+}
+func (c *Conn) connectionStateLocked() ConnectionState {
+	var state ConnectionState
+	state.HandshakeComplete = c.handshakeStatus == 255
+	state.Version = c.vers
+	state.NegotiatedProtocol = c.clientProtocol
+	state.DidResume = c.didResume
+	state.NegotiatedProtocolIsMutual = !c.clientProtocolFallback
+	state.ServerName = c.serverName
+	state.CipherSuite = c.cipherSuite
+	state.PeerCertificates = c.peerCertificates
+	state.VerifiedChains = c.verifiedChains
+	state.SignedCertificateTimestamps = c.scts
+	state.OCSPResponse = c.ocspResponse
+	if !c.didResume && c.vers != VersionTLS13 {
+		if c.clientFinishedIsFirst {
+			state.TLSUnique = c.clientFinished[:]
+		} else {
+			state.TLSUnique = c.serverFinished[:]
+		}
+	}
+	if c.config.Renegotiation != RenegotiateNever {
+		state.ekm = noExportedKeyingMaterial
+	} else {
+		state.ekm = c.ekm
+	}
+	return state
 }
 func (c *Conn) HandshakeComplete() bool {
 	return c.handshakeStatus == 255

@@ -14,6 +14,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
+	"time"
 )
 
 // serverHandshakeState contains details of a server handshake in progress.
@@ -31,16 +33,10 @@ type serverHandshakeState struct {
 	finishedHash finishedHash
 	masterSecret []byte
 	cert         *Certificate
-	wait         chan int
+
 	keyAgreement keyAgreement
 	certReq      *certificateRequestMsg
 }
-
-const (
-	wait_msgin = iota
-	wait_timeout
-	wait_done
-)
 
 // serverHandshake performs a TLS handshake as a server.
 func (c *Conn) serverHandshake() error {
@@ -49,7 +45,7 @@ func (c *Conn) serverHandshake() error {
 	//gnet不能进行阻塞二次读取，所以会分几条消息重复执行此方法，status也会分很多个状态
 	if c.hs == nil {
 		//首次执行要初始化对象
-		c.config.serverInitOnce.Do(func() { c.config.serverInit(nil) })
+
 		clientHello, err := c.readClientHello()
 		if err != nil {
 			return err
@@ -64,7 +60,6 @@ func (c *Conn) serverHandshake() error {
 			c.hs = &serverHandshakeState{
 				c:           c,
 				clientHello: clientHello,
-				wait:        make(chan int, 1),
 			}
 		}
 	}
@@ -86,19 +81,15 @@ func (hs *serverHandshakeState) handshake() error {
 		switch c.handshakeStatus {
 		case 0:
 			// The client has included a session ticket and so we do an abbreviated handshake.
+			c.didResume = true
 			if err := hs.doResumeHandshake(); err != nil {
 				return err
 			}
 			if err := hs.establishKeys(); err != nil {
 				return err
 			}
-			// ticketSupported is set in a resumption handshake if the
-			// ticket from the client was encrypted with an old session
-			// ticket key and thus a refreshed ticket should be sent.
-			if hs.hello.ticketSupported {
-				if err := hs.sendSessionTicket(); err != nil {
-					return err
-				}
+			if err := hs.sendSessionTicket(); err != nil {
+				return err
 			}
 			if err := hs.sendFinished(c.serverFinished[:]); err != nil {
 				return err
@@ -113,9 +104,9 @@ func (hs *serverHandshakeState) handshake() error {
 			if err := hs.readFinished(nil); err != nil {
 				return err
 			}
-			c.didResume = true
+
 		default:
-			fmt.Println("来自下面的status", c.handshakeStatus)
+			return errors.New("错误的status状态" + strconv.Itoa(int(c.handshakeStatus)))
 		}
 	} else {
 		// The client didn't include a session ticket, or it wasn't
@@ -179,16 +170,18 @@ func (c *Conn) readClientHello() (*clientHelloMsg, error) {
 		return nil, unexpectedMessageError(clientHello, msg)
 	}
 
+	var configForClient *Config
+	originalConfig := c.config
 	if c.config.GetConfigForClient != nil {
 		chi := clientHelloInfo(c, clientHello)
-		if newConfig, err := c.config.GetConfigForClient(chi); err != nil {
+		if configForClient, err = c.config.GetConfigForClient(chi); err != nil {
 			c.sendAlert(alertInternalError)
 			return nil, err
-		} else if newConfig != nil {
-			newConfig.serverInitOnce.Do(func() { newConfig.serverInit(c.config) })
-			c.config = newConfig
+		} else if configForClient != nil {
+			c.config = configForClient
 		}
 	}
+	c.ticketKeys = originalConfig.ticketKeys(configForClient)
 
 	clientVersions := clientHello.supportedVersions
 	if len(clientHello.supportedVersions) == 0 {
@@ -230,7 +223,7 @@ func (hs *serverHandshakeState) processClientHello() error {
 	serverRandom := hs.hello.random
 	// Downgrade protection canaries. See RFC 8446, Section 4.1.3.
 	maxVers := c.config.maxSupportedVersion()
-	if maxVers >= VersionTLS12 && c.vers < maxVers {
+	if maxVers >= VersionTLS12 && c.vers < maxVers || testingOnlyForceDowngradeCanary {
 		if c.vers == VersionTLS12 {
 			copy(serverRandom[24:], downgradeCanaryTLS12)
 		} else {
@@ -351,6 +344,7 @@ func (hs *serverHandshakeState) pickCipherSuite() error {
 		c.sendAlert(alertHandshakeFailure)
 		return errors.New("tls: no cipher suite supported by both client and server")
 	}
+	c.cipherSuite = hs.suite.id
 
 	for _, id := range hs.clientHello.cipherSuites {
 		if id == TLS_FALLBACK_SCSV {
@@ -405,6 +399,11 @@ func (hs *serverHandshakeState) checkForResumption() bool {
 		return false
 	}
 
+	createdAt := time.Unix(int64(hs.sessionState.createdAt), 0)
+	if c.config.time().Sub(createdAt) > maxSessionTicketLifetime {
+		return false
+	}
+
 	// Never resume a session for a different TLS version.
 	if c.vers != hs.sessionState.vers {
 		return false
@@ -445,6 +444,7 @@ func (hs *serverHandshakeState) doResumeHandshake() error {
 	c := hs.c
 
 	hs.hello.cipherSuite = hs.suite.id
+	c.cipherSuite = hs.suite.id
 	// We echo the client's session ID in the ServerHello to let it know
 	// that we're doing a resumption.
 	hs.hello.sessionId = hs.clientHello.sessionId
@@ -461,6 +461,13 @@ func (hs *serverHandshakeState) doResumeHandshake() error {
 		Certificate: hs.sessionState.certificates,
 	}); err != nil {
 		return err
+	}
+
+	if c.config.VerifyConnection != nil {
+		if err := c.config.VerifyConnection(c.connectionStateLocked()); err != nil {
+			c.sendAlert(alertBadCertificate)
+			return err
+		}
 	}
 
 	hs.masterSecret = hs.sessionState.masterSecret
@@ -585,6 +592,12 @@ func (hs *serverHandshakeState) doFullHandshakeStep2() error {
 
 		msg, err = c.readHandshake()
 		if err != nil {
+			return err
+		}
+	}
+	if c.config.VerifyConnection != nil {
+		if err := c.config.VerifyConnection(c.connectionStateLocked()); err != nil {
+			c.sendAlert(alertBadCertificate)
 			return err
 		}
 	}
@@ -713,12 +726,22 @@ func (hs *serverHandshakeState) readFinished(out []byte) error {
 }
 
 func (hs *serverHandshakeState) sendSessionTicket() error {
+	// ticketSupported is set in a resumption handshake if the
+	// ticket from the client was encrypted with an old session
+	// ticket key and thus a refreshed ticket should be sent.
 	if !hs.hello.ticketSupported {
 		return nil
 	}
 
 	c := hs.c
 	m := new(newSessionTicketMsg)
+
+	createdAt := uint64(c.config.time().Unix())
+	if hs.sessionState != nil {
+		// If this is re-wrapping an old key, then keep
+		// the original time it was created.
+		createdAt = hs.sessionState.createdAt
+	}
 
 	var certsFromClient [][]byte
 	for _, cert := range c.peerCertificates {
@@ -727,6 +750,7 @@ func (hs *serverHandshakeState) sendSessionTicket() error {
 	state := sessionState{
 		vers:         c.vers,
 		cipherSuite:  hs.suite.id,
+		createdAt:    createdAt,
 		masterSecret: hs.masterSecret,
 		certificates: certsFromClient,
 	}
@@ -758,7 +782,6 @@ func (hs *serverHandshakeState) sendFinished(out []byte) error {
 		return err
 	}
 
-	c.cipherSuite = hs.suite.id
 	copy(out, finished.verifyData)
 
 	return nil
@@ -804,6 +827,19 @@ func (c *Conn) processCertsFromClient(certificate Certificate) error {
 		c.verifiedChains = chains
 	}
 
+	c.peerCertificates = certs
+	c.ocspResponse = certificate.OCSPStaple
+	c.scts = certificate.SignedCertificateTimestamps
+
+	if len(certs) > 0 {
+		switch certs[0].PublicKey.(type) {
+		case *ecdsa.PublicKey, *rsa.PublicKey, ed25519.PublicKey:
+		default:
+			c.sendAlert(alertUnsupportedCertificate)
+			return fmt.Errorf("tls: client certificate contains an unsupported public key of type %T", certs[0].PublicKey)
+		}
+	}
+
 	if c.config.VerifyPeerCertificate != nil {
 		if err := c.config.VerifyPeerCertificate(certificates, c.verifiedChains); err != nil {
 			c.sendAlert(alertBadCertificate)
@@ -811,20 +847,6 @@ func (c *Conn) processCertsFromClient(certificate Certificate) error {
 		}
 	}
 
-	if len(certs) == 0 {
-		return nil
-	}
-
-	switch certs[0].PublicKey.(type) {
-	case *ecdsa.PublicKey, *rsa.PublicKey, ed25519.PublicKey:
-	default:
-		c.sendAlert(alertUnsupportedCertificate)
-		return fmt.Errorf("tls: client certificate contains an unsupported public key of type %T", certs[0].PublicKey)
-	}
-
-	c.peerCertificates = certs
-	c.ocspResponse = certificate.OCSPStaple
-	c.scts = certificate.SignedCertificateTimestamps
 	return nil
 }
 
