@@ -34,8 +34,9 @@ func (w *MsgBuffer) Make(l int) []byte {
 	w.l += l
 	if len(w.b) < w.l { //扩容
 		if cap(w.b) < w.l {
-			if l > appendsize {
-				w.b = append(w.b, make([]byte, l)...)
+			add := w.l - len(w.b)
+			if add > appendsize {
+				w.b = append(w.b, make([]byte, add)...)
 			} else {
 				w.b = append(w.b, make([]byte, appendsize)...)
 			}
@@ -53,10 +54,11 @@ func (w *MsgBuffer) Write(b []byte) (int, error) {
 	l := len(b)
 	o := w.l
 	w.l += l
-	if len(w.b) < w.l { //扩容
+	if len(w.b) < w.l {
 		if cap(w.b) < w.l {
-			if l > appendsize {
-				w.b = append(w.b, make([]byte, l)...)
+			add := w.l - len(w.b)
+			if add > appendsize {
+				w.b = append(w.b, make([]byte, add)...)
 			} else {
 				w.b = append(w.b, make([]byte, appendsize)...)
 			}
@@ -80,8 +82,9 @@ func (w *MsgBuffer) WriteString(s string) {
 	w.l += l
 	if len(w.b) < w.l { //扩容
 		if cap(w.b) < w.l {
-			if l > appendsize {
-				w.b = append(w.b, make([]byte, l)...)
+			add := w.l - len(w.b)
+			if add > appendsize {
+				w.b = append(w.b, make([]byte, add)...)
 			} else {
 				w.b = append(w.b, make([]byte, appendsize)...)
 			}
@@ -99,7 +102,12 @@ func (w *MsgBuffer) WriteByte(s byte) {
 	w.l++
 	if len(w.b) < w.l {
 		if cap(w.b) < w.l {
-			w.b = append(w.b, make([]byte, appendsize)...)
+			add := w.l - len(w.b)
+			if add > appendsize {
+				w.b = append(w.b, make([]byte, add)...)
+			} else {
+				w.b = append(w.b, make([]byte, appendsize)...)
+			}
 		}
 		w.b = w.b[:w.l]
 	}
