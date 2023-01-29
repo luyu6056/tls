@@ -35,7 +35,7 @@ type conn interface {
 // using conn as the underlying transport.
 // The configuration config must be non-nil and must include
 // at least one certificate or else set GetCertificate.
-func Server(c conn, in, out *MsgBuffer, config *Config) (*Conn, error) {
+func Server(c conn, in, out **MsgBuffer, config *Config) (*Conn, error) {
 	tlsconn := &Conn{
 		conn:    c,
 		config:  config,
@@ -46,7 +46,7 @@ func Server(c conn, in, out *MsgBuffer, config *Config) (*Conn, error) {
 
 	return tlsconn, nil
 }
-func Client(c conn, in, out *MsgBuffer, config *Config) *Conn {
+func Client(c conn, in, out **MsgBuffer, config *Config) *Conn {
 	tlsconn := &Conn{
 		conn:     c,
 		config:   config,

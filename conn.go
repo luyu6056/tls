@@ -87,11 +87,11 @@ type Conn struct {
 	// input/output
 	in, out   halfConn
 	rawInput  MsgBuffer  // raw input, starting with a record header
-	input     *MsgBuffer // 指针指向gnet.conn的inboundBuffer
+	input     **MsgBuffer // 指针指向gnet.conn的inboundBuffer
 	hand      MsgBuffer  // handshake data waiting to be read
 	outBuf    []byte     // scratch buffer used by out.encrypt
 	buffering bool       // whether records are buffered in sendBuf
-	sendBuf   *MsgBuffer // a buffer of records waiting to be sent
+	sendBuf   **MsgBuffer // a buffer of records waiting to be sent
 
 	// bytesSent counts the bytes of application data sent.
 	// packetsSent counts packets.
@@ -535,7 +535,7 @@ func (c *Conn) readRecord() error {
 }
 
 func (c *Conn) readChangeCipherSpec() error {
-	c.input.Reset()
+	(*c.input).Reset()
 	return c.readRecordOrCCS(true)
 }
 
@@ -680,7 +680,7 @@ func (c *Conn) readRecordOrCCS(expectChangeCipherSpec bool) error {
 		// Note that data is owned by c.rawInput, following the Next call above,
 		// to avoid copying the plaintext. This is safe because c.rawInput is
 		// not read from or written to until c.input is drained.
-		c.input.Write(data)
+		(*c.input).Write(data)
 
 	case recordTypeHandshake:
 		if len(data) == 0 || expectChangeCipherSpec {
@@ -700,7 +700,7 @@ func (c *Conn) retryReadRecord(expectChangeCipherSpec bool) error {
 		c.sendAlert(alertUnexpectedMessage)
 		return c.in.setErrorLocked(errors.New("tls: too many ignored records"))
 	}
-	c.input.Reset()
+	(*c.input).Reset()
 	if c.rawInput.Len() > 5 {
 		return c.readRecordOrCCS(expectChangeCipherSpec)
 	}
@@ -812,13 +812,13 @@ func (c *Conn) maxPayloadSizeForWrite(typ recordType) int {
 func (c *Conn) write(data []byte) (n int, err error) {
 	//必须把所有数据往buf写
 	n = len(data)
-	c.sendBuf.Write(data)
+	(*c.sendBuf).Write(data)
 	c.bytesSent += int64(n)
 	return
 }
 
 func (c *Conn) flush() (int, error) {
-	if c.sendBuf.Len() == 0 {
+	if (*c.sendBuf).Len() == 0 {
 		return 0, nil
 	}
 	n, err := c.conn.Write(nil)
